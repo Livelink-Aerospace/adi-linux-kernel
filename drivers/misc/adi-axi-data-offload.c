@@ -31,10 +31,9 @@
 #define AXI_DO_REG_MAGIC			0x000c
 #define   AXI_DO_VAL_MAGIC			0x44414f46
 #define AXI_DO_REG_SYNTHESIS_CONFIG		0x0010
+#define   AXI_DO_BIT_SYNTHESIS_CONFIG_MEM_SIZE_LOG2 GENMASK(13, 8)
 #define   AXI_DO_BIT_SYNTHESIS_CONFIG_MEM_TYPE	BIT(0)
 #define   AXI_DO_BIT_SYNTHESIS_CONFIG_TX_RXN	BIT(1)
-#define AXI_DO_REG_MEMORY_SIZE_LSB		0x0014
-#define AXI_DO_REG_MEMORY_SIZE_MSB		0x0018
 #define AXI_DO_REG_TRANSFER_LENGTH		0x001c
 
 #define AXI_DO_REG_MEM_PHY_STATE		0x0080
@@ -246,12 +245,12 @@ ADI_REG_DEVICE_ATTR(identification, 0444, AXI_DO_REG_IDENTIFICATION, ~0u, 0, "%l
 ADI_REG_DEVICE_ATTR(scratch, 0644, AXI_DO_REG_SCRATCH, ~0u, 0, "0x%08llx\n", false);
 ADI_REG_DEVICE_ATTR(magic, 0444, AXI_DO_REG_MAGIC, ~0u, 0, "0x%08llx\n", false);
 
+ADI_REG_DEVICE_ATTR(memory_size_log2, 0444, AXI_DO_REG_SYNTHESIS_CONFIG,
+		AXI_DO_BIT_SYNTHESIS_CONFIG_MEM_SIZE_LOG2, 8, "%lld\n", false);
 ADI_REG_DEVICE_ATTR(synthesis_mem_type, 0444, AXI_DO_REG_SYNTHESIS_CONFIG,
 		    BIT(0), 0, "%lld\n", false);
 ADI_REG_DEVICE_ATTR(synthesis_tx_rxn, 0444, AXI_DO_REG_SYNTHESIS_CONFIG,
 		    BIT(1), 1, "%lld\n", false);
-ADI_REG_DEVICE_ATTR(memory_size, 0444, AXI_DO_REG_MEMORY_SIZE_LSB,
-		    GENMASK(1, 0), 0, "%lld\n", true);
 ADI_REG_DEVICE_ATTR(transfer_length, 0644, AXI_DO_REG_TRANSFER_LENGTH,
 		    ~0u, 0, "0x%llx\n", false);
 
@@ -278,7 +277,7 @@ static struct axi_do_dbg_attr *axi_data_offload_dbg_attrs[] = {
 	&axi_data_offload_dbg_magic_attr,
 	&axi_data_offload_dbg_synthesis_mem_type_attr,
 	&axi_data_offload_dbg_synthesis_tx_rxn_attr,
-	&axi_data_offload_dbg_memory_size_attr,
+	&axi_data_offload_dbg_memory_size_log2_attr,
 	&axi_data_offload_dbg_transfer_length_attr,
 	&axi_data_offload_dbg_phy_calib_complete_attr,
 	&axi_data_offload_dbg_resetn_attr,
@@ -428,8 +427,9 @@ static int axi_data_offload_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	st->mem_size = axi_data_offload_read(st, AXI_DO_REG_MEMORY_SIZE_LSB)
-		| ((u64)(axi_data_offload_read(st, AXI_DO_REG_MEMORY_SIZE_MSB) & GENMASK(1, 0)) << 32);
+	st->mem_size =
+		(u64) 1 << ((axi_data_offload_read(st, AXI_DO_REG_SYNTHESIS_CONFIG) &
+					AXI_DO_BIT_SYNTHESIS_CONFIG_MEM_SIZE_LOG2) >> 8);
 
 	if (!IS_ERR(axi_data_offload_dbg_parent)) {
 		st->debugdir = debugfs_create_dir(np->name, axi_data_offload_dbg_parent);
