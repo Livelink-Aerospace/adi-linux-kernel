@@ -193,7 +193,8 @@ build_default() {
 	
 	# make sure git does not complain about unsafe repositories when
 	# building inside docker.
-	[ -d /docker_build_dir ] && git config --add safe.directory /docker_build_dir
+	[ -d /docker_build_dir ] && git config --global --add safe.directory /docker_build_dir
+	echo "ls=$(ls -la)"
 
 	make ${DEFCONFIG}
 	if [[ "${SYSTEM_PULLREQUEST_TARGETBRANCH}" =~ ^rpi-.* || "${BUILD_SOURCEBRANCH}" =~ ^refs/heads/rpi-.* \
