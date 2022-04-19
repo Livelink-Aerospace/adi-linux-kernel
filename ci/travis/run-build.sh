@@ -4,9 +4,6 @@ set -e
 # cd to docker build dir if it exists
 if [ -d /docker_build_dir ] ; then
 	cd /docker_build_dir
-	# make sure git does not complain about unsafe repositories when
-	# building inside docker.
-	git config  --global --add safe.directory /docker_build_dir
 	echo "UID=$UID, GID=$GID"
 fi
 
@@ -193,6 +190,11 @@ build_default() {
 	APT_LIST="$APT_LIST git"
 
 	apt_update_install $APT_LIST
+	
+	# make sure git does not complain about unsafe repositories when
+	# building inside docker.
+	[ -d /docker_build_dir ] && git config --add safe.directory /docker_build_dir
+
 	make ${DEFCONFIG}
 	if [[ "${SYSTEM_PULLREQUEST_TARGETBRANCH}" =~ ^rpi-.* || "${BUILD_SOURCEBRANCH}" =~ ^refs/heads/rpi-.* \
 		|| "${BUILD_SOURCEBRANCH}" =~ ^refs/heads/staging-rpi ]]; then
