@@ -2,7 +2,7 @@
 /*
  * Analog Devices AD4630 SPI ADC driver
  *
- * Copyright 2021 Analog Devices Inc.
+ * Copyright 2022 Analog Devices Inc.
  */
 #include <linux/bitfield.h>
 #include <linux/clk.h>
@@ -119,12 +119,6 @@ enum ad4630_id {
 	ID_AD463X = 0xFF
 };
 
-unsigned char ad4630_chip_grades[] = {
-	[ID_AD4030_24] = 0x81,
-	[ID_AD4630_16] = 0x19,
-	[ID_AD4630_24] = 0x00,
-};
-
 enum ad4630_lane_mode {
 	AD4630_ONE_LANE_PER_CH = 0x00,
 	AD4630_TWO_LANES_PER_CH = BIT(6),
@@ -154,6 +148,12 @@ enum ad4630_out_data_mode {
 enum ad4630_power_mode {
 	AD4630_NORMAL_OPERATING_MODE = 0,
 	AD4630_LOW_POWER_MODE = (BIT(0) | BIT(1)),
+};
+
+static const unsigned char ad4630_chip_grades[] = {
+	[ID_AD4030_24] = 0x81,
+	[ID_AD4630_16] = 0x19,
+	[ID_AD4630_24] = 0x00,
 };
 
 static const char *const ad4630_lane_mdoes[] = {
@@ -208,11 +208,6 @@ struct ad4630_phy_config {
 	int num_avg_samples;
 };
 
-struct ad4630_channel_config {
-	unsigned int offset;
-	unsigned int gain;
-};
-
 struct ad4630_state {
 	struct mutex lock;
 	struct spi_device *spi;
@@ -221,8 +216,8 @@ struct ad4630_state {
 	struct ad4630_phy_config phy;
 	struct pwm_device *conversion_trigger;
 	struct pwm_device *spi_engine_trigger;
-	struct ad4630_channel_config channel_cfg[2];
 	
+	bool buffer_enabled;
 	unsigned int sampling_frequency;
 
 	union {
@@ -238,16 +233,13 @@ static int ad4630_spi_read_reg(struct ad4630_state *st, unsigned int reg_addr,
 			       unsigned int *reg_data)
 {
 	struct spi_transfer xfer = {
-		.tx_buf = st->adc_data[0].buff,
-		.rx_buf = st->adc_data[1].buff,
 		.len = 3,
 		.bits_per_word = 8,
+		.tx_buf = st->adc_data[0].buff,
+		.rx_buf = st->adc_data[1].buff,
 		.speed_hz = AD4630_SPI_REG_ACCESS_SPEED
 	};
 	int ret;
-
-	if (mutex_is_locked(&st->spi->controller->bus_lock_mutex))
-		return -EBUSY;
 
 	st->adc_data[0].reg_addr = cpu_to_be16(AD4630_REG_READ_MASK(reg_addr));
 	st->adc_data[0].reg_data = AD4630_REG_READ_DUMMY;
@@ -265,14 +257,11 @@ static int ad4630_spi_write_reg(struct ad4630_state *st, unsigned int reg_addr,
 				unsigned int reg_data)
 {
 	struct spi_transfer xfer = {
-		.tx_buf = st->adc_data[0].buff,
 		.len = 3,
 		.bits_per_word = 8,
+		.tx_buf = st->adc_data[0].buff,
 		.speed_hz = AD4630_SPI_REG_ACCESS_SPEED
 	};
-
-	if (mutex_is_locked(&st->spi->controller->bus_lock_mutex))
-		return -EBUSY;
 
 	st->adc_data[0].reg_addr = cpu_to_be16(AD4630_REG_WRITE_MASK(reg_addr));
 	st->adc_data[0].reg_data = reg_data;
@@ -293,7 +282,6 @@ static int ad4630_spi_write_reg_masked(struct ad4630_state *st,
 
 	return ad4630_spi_write_reg(st, reg_addr, ((temp & ~mask) | reg_data));
 }
-
 static int ad4630_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 			     unsigned int writeval, unsigned int *readval)
 {
@@ -313,13 +301,23 @@ static int ad4630_reg_access(struct iio_dev *indio_dev, unsigned int reg,
 static int ad4630_set_reg_access(struct ad4630_state *st, bool state)
 {
 	unsigned int dummy;
+	int ret;
 
-	if (state)
+	if (state) {
 		/* Send a sequence starting with "1 0 1" to the SPI bus*/
-		return ad4630_spi_read_reg(st, AD4630_CONFIG_TIMING, &dummy);
+		ret = ad4630_spi_read_reg(st, AD4630_CONFIG_TIMING, &dummy);
+		if (ret < 0)
+			return ret;
+	} else {
+		ret = ad4630_spi_write_reg(st, AD4630_REG_EXIT_CFG_MODE,
+				AD4630_EXIT_CFG_MODE);
+		if (ret < 0)
+			return ret;
+	}
 
-	return ad4630_spi_write_reg(st, AD4630_REG_EXIT_CFG_MODE,
-				    AD4630_EXIT_CFG_MODE);
+	st->buffer_enabled = !state;
+
+	return 0;
 }
 
 static int ad4630_set_sampling_freq(struct ad4630_state *st, unsigned int freq)
@@ -330,7 +328,7 @@ static int ad4630_set_sampling_freq(struct ad4630_state *st, unsigned int freq)
 		.enabled = true,
 	}, spi_trigger_state = {
 		.duty_cycle = AD4630_T_CONV_HI_PS,
-		.offset = AD4630_T_CONV_HI_PS,
+		.phase = AD4630_T_CONV_HI_PS,
 		.time_unit = PWM_UNIT_PSEC,
 		.enabled = true,
 	};
@@ -338,18 +336,12 @@ static int ad4630_set_sampling_freq(struct ad4630_state *st, unsigned int freq)
 	unsigned long clk_rate;
 	int ret;
 
-
 	freq = clamp_t(unsigned int, freq, 0, 2000000);
 	clk_rate = clk_get_rate(st->trigger_clock);
 	target = DIV_ROUND_CLOSEST_ULL(clk_rate, freq);
 	period_ps = DIV_ROUND_CLOSEST_ULL(1000000000000ULL, clk_rate);
-
 	conversion_state.period = target * period_ps;
 	spi_trigger_state.period = target * period_ps;
-
-	if (mutex_is_locked(&st->lock))
-		return -EBUSY;
-
 	ret = pwm_apply_state(st->conversion_trigger, &conversion_state);
 	if (ret < 0)
 		return ret;
@@ -366,29 +358,15 @@ static int ad4630_set_sampling_freq(struct ad4630_state *st, unsigned int freq)
 	return ret;
 }
 
-static int ad4630_get_avg_frame_len(struct iio_dev *dev,
-				    const struct iio_chan_spec *chan)
-{
-	struct ad4630_state *st = iio_priv(dev);
-	unsigned int avg_len;
-	int ret;
-
-	if (st->phy.out_data_mode != AD4630_30_AVERAGED_DIFF)
-		return 0;
-
-	ret = ad4630_spi_read_reg(st, AD4630_REG_AVG, &avg_len);
-	if (ret < 0)
-		return ret;
-
-	return avg_len;
-}
-
 static int ad4630_set_avg_frame_len(struct iio_dev *dev,
 				    const struct iio_chan_spec *chan,
 				    unsigned int avg_len)
 {
 	int ret;
 	struct ad4630_state *st = iio_priv(dev);
+
+	if (st->buffer_enabled)
+		return -EBUSY;
 
 	if (st->phy.out_data_mode != AD4630_30_AVERAGED_DIFF || avg_len == 0)
 		return -EINVAL;
@@ -400,6 +378,35 @@ static int ad4630_set_avg_frame_len(struct iio_dev *dev,
 		return ret;
 
 	return ad4630_spi_write_reg(st, AD4630_REG_AVG, avg_len);
+}
+
+static int ad4630_get_avg_frame_len(struct iio_dev *dev,
+				    const struct iio_chan_spec *chan)
+{
+	struct ad4630_state *st = iio_priv(dev);
+	unsigned int avg_len;
+	int ret;
+
+	if (st->buffer_enabled)
+		return -EBUSY;
+
+	if (st->phy.out_data_mode != AD4630_30_AVERAGED_DIFF)
+		return 0;
+
+	ret = ad4630_spi_read_reg(st, AD4630_REG_AVG, &avg_len);
+	if (ret < 0)
+		return ret;
+
+	return avg_len;
+}
+
+static int ad4630_set_pwr_mode(struct iio_dev *dev,
+			       const struct iio_chan_spec *chan,
+			       unsigned int mode)
+{
+	struct ad4630_state *st = iio_priv(dev);
+
+	return ad4630_spi_write_reg(st, AD4630_REG_DEVICE_CONFIG, mode);
 }
 
 static int ad4630_get_pwr_mode(struct iio_dev *dev,
@@ -416,45 +423,40 @@ static int ad4630_get_pwr_mode(struct iio_dev *dev,
 	return mode;
 }
 
-static int ad4630_set_pwr_mode(struct iio_dev *dev,
-			       const struct iio_chan_spec *chan,
-			       unsigned int mode)
-{
-	struct ad4630_state *st = iio_priv(dev);
-
-	return ad4630_spi_write_reg(st, AD4630_REG_DEVICE_CONFIG, mode);
-}
-
 static int ad4630_phy_init(struct ad4630_state *st)
 {
 	int ret;
 
 	ret = ad4630_spi_write_reg_masked(st, AD4630_REG_MODES,
-					  AD4630_LANE_MODE_MSK,
-					  st->phy.lane_mode);
+				 AD4630_LANE_MODE_MSK,
+				 st->phy.lane_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = ad4630_spi_write_reg_masked(st, AD4630_REG_MODES,
-					  AD4630_CLK_MODE_MSK,
-					  st->phy.clock_mode);
+				 AD4630_CLK_MODE_MSK,
+				 st->phy.clock_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = ad4630_spi_write_reg_masked(st, AD4630_REG_MODES,
-					  AD4630_DATA_RATE_MODE_MSK,
-					  st->phy.data_rate_mode);
+				 AD4630_DATA_RATE_MODE_MSK,
+				 st->phy.data_rate_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = ad4630_spi_write_reg_masked(st, AD4630_REG_MODES,
-					  AD4630_OUT_DATA_MODE_MSK,
-					  st->phy.out_data_mode);
+				 AD4630_OUT_DATA_MODE_MSK,
+				 st->phy.out_data_mode);
 	if (ret < 0)
 		return ret;
 
 	if (st->phy.out_data_mode == AD4630_30_AVERAGED_DIFF) {
 		ret = ad4630_spi_write_reg(st, AD4630_REG_AVG,
-					   AD4630_AVG_LEN_DEFAULT);
+				   AD4630_AVG_LEN_DEFAULT);
 		if (ret < 0)
 			return ret;
+
 		st->phy.num_avg_samples = 64;
 	}
 
@@ -490,19 +492,21 @@ static int ad4630_parse_dt(struct iio_dev *indio_dev)
 	int ret;
 
 	fwnode = dev_fwnode(indio_dev->dev.parent);
-
 	ret = fwnode_property_read_string(fwnode, "adi,lane-mode",
 					  &lane_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = fwnode_property_read_string(fwnode, "adi,clock-mode",
 					  &clock_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = fwnode_property_read_string(fwnode, "adi,data-rate-mode",
 					  &data_rate_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = fwnode_property_read_string(fwnode, "adi,out-data-mode",
 					  &out_data_mode);
 	if (ret < 0)
@@ -513,11 +517,13 @@ static int ad4630_parse_dt(struct iio_dev *indio_dev)
 				      &st->phy.lane_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = ad4630_get_string_index(clock_mode, ad4630_clock_mdoes,
 				      ARRAY_SIZE(ad4630_clock_mdoes),
 				      &st->phy.clock_mode);
 	if (ret < 0)
 		return ret;
+
 	ret = ad4630_get_string_index(data_rate_mode, ad4630_data_rates,
 				      ARRAY_SIZE(ad4630_data_rates),
 				      &st->phy.data_rate_mode);
@@ -537,22 +543,58 @@ static int ad4630_set_chan_offset(struct ad4630_state *st, int chan_idx,
 	if (abs(offset) > 0x7FFFFF)
 		return -EINVAL;
 
+	mutex_lock(&st->lock);
 	ret = ad4630_spi_write_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 0),
 				   offset);
 	if (ret < 0)
-		return ret;
+		goto err_set_chan_offset;
+
 	ret = ad4630_spi_write_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 1),
 				   offset >> 8);
 	if (ret < 0)
-		return ret;
+		goto err_set_chan_offset;
+
 	ret = ad4630_spi_write_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 2),
 				   offset >> 16);
 	if (ret < 0)
-		return ret;
+		goto err_set_chan_offset;
 
-	st->channel_cfg[chan_idx].offset = offset;
+err_set_chan_offset:
+	mutex_unlock(&st->lock);
 
-	return 0;
+	return ret;
+}
+
+static int ad4630_get_chan_offset(struct ad4630_state *st, int chan_idx,
+				  int *val)
+{
+	unsigned int reg;
+	int offset;
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad4630_spi_read_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 0),
+			  &reg);
+	if (ret < 0)
+		goto err_get_chan_offset;
+	
+	offset = reg;
+	ret = ad4630_spi_read_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 1),
+			  &reg);
+	if (ret < 0)
+		goto err_get_chan_offset;
+
+	offset |= reg << 8;
+	ret = ad4630_spi_read_reg(st, AD4630_REG_CHAN_OFFSET(chan_idx, 2),
+			  &reg);
+	if (ret < 0)
+		goto err_get_chan_offset;
+	
+	*val = offset | (reg << 16);
+err_get_chan_offset:
+	mutex_unlock(&st->lock);
+
+	return ret;
 }
 
 static int ad4630_set_chan_gain(struct ad4630_state *st, int chan_idx,
@@ -567,20 +609,43 @@ static int ad4630_set_chan_gain(struct ad4630_state *st, int chan_idx,
 	gain = ((gain_int * 10000) + (gain_frac / 100));
 	gain = clamp_t(unsigned int, gain, 0, 19999);
 	gain = DIV_ROUND_UP(gain * 0x8000, 10000);
-
+	mutex_lock(&st->lock);
 	ret = ad4630_spi_write_reg(st, AD4630_REG_CHAN_GAIN(chan_idx, 0), 
 				   gain);
 	if (ret < 0)
-		return ret;
+	if (ret < 0)
+		goto err_set_chan_gain;
 
 	ret = ad4630_spi_write_reg(st, AD4630_REG_CHAN_GAIN(chan_idx, 1),
 				   gain >> 8);
 	if (ret < 0)
-		return ret;
+		goto err_set_chan_gain;
 
-	st->channel_cfg[chan_idx].gain = gain;
+err_set_chan_gain:
+	mutex_unlock(&st->lock);
 
-	return 0;
+	return ret;
+}
+static int ad4630_get_chan_gain(struct ad4630_state *st, int chan_idx,
+				int *val)
+{
+	unsigned int gain, reg;
+	int ret;
+
+	mutex_lock(&st->lock);
+	ret = ad4630_spi_read_reg(st, AD4630_REG_CHAN_GAIN(chan_idx, 0), &gain);
+	if (ret < 0)
+		goto err_get_chan_gain;
+
+	ret = ad4630_spi_read_reg(st, AD4630_REG_CHAN_GAIN(chan_idx, 1), &reg);
+	if (ret < 0)
+		goto err_get_chan_gain;
+
+	*val = gain | (reg << 8);
+err_get_chan_gain:
+	mutex_unlock(&st->lock);
+
+	return ret;
 }
 
 static int ad4630_read_raw(struct iio_dev *indio_dev,
@@ -589,59 +654,63 @@ static int ad4630_read_raw(struct iio_dev *indio_dev,
 {
 	struct ad4630_state *st = iio_priv(indio_dev);
 	unsigned int temp;
+	int ret;
 
 	switch (info) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		*val = st->sampling_frequency;
 
 		return IIO_VAL_INT;
+
 	case IIO_CHAN_INFO_HARDWAREGAIN:
-		temp = st->channel_cfg[chan->scan_index].gain * 10000;
+		ret = ad4630_get_chan_gain(st, chan->scan_index, &temp);
+		if (ret < 0)
+			return ret;
+
+		temp *= 10000;
 		temp /= 0x8000;
 		*val = temp / 10000;
 		*val2 = (temp - (*val * 10000)) * 100;
 
 		return IIO_VAL_INT_PLUS_MICRO;
+
 	case IIO_CHAN_INFO_OFFSET:
-		*val = st->channel_cfg[chan->scan_index].offset;
+		ret = ad4630_get_chan_offset(st, chan->scan_index, val);
+		if (ret < 0)
+			return ret;
 
 		return IIO_VAL_INT;
-	default:
-		return -EINVAL;
 	}
+	
+	return -EINVAL;
 }
 
 static int ad4630_write_raw(struct iio_dev *indio_dev,
 			    struct iio_chan_spec const *chan, int val,
 			    int val2, long info)
 {
-	int ret;
 	struct ad4630_state *st = iio_priv(indio_dev);
 
 	switch (info) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ad4630_set_sampling_freq(st, val);
+
 	case IIO_CHAN_INFO_HARDWAREGAIN:
 		return ad4630_set_chan_gain(st, chan->scan_index, val, val2);
+
 	case IIO_CHAN_INFO_OFFSET:
 		return ad4630_set_chan_offset(st, chan->scan_index, val);
-	default:
-		return -EINVAL;
 	}
 
-	return ret;
+	return -EINVAL;
 }
 
 static int ad4630_setup(struct ad4630_state *st)
 {
 	int ret;
 
-	gpiod_direction_output(st->gpio_reset, 0);
-	usleep_range(5000, 5005);
-	gpiod_set_value(st->gpio_reset, 1);
-	usleep_range(50, 55);
-	gpiod_set_value(st->gpio_reset, 0);
-	usleep_range(5000, 5005);
+	gpiod_set_value_cansleep(st->gpio_reset, 0);
+	usleep_range(50, 65);
 
 	ret = ad4630_set_reg_access(st, true);
 	if (ret < 0)
@@ -686,9 +755,9 @@ static int ad4630_buffer_preenable(struct iio_dev *indio_dev)
 	int ret;
 
 	struct spi_transfer xfer = {
+		.len = 1,
 		.tx_buf = NULL,
 		.rx_buf = data,
-		.len = 1,
 		.speed_hz = AD4630_SPI_SAMPLING_SPEED,
 	};
 
@@ -712,7 +781,6 @@ static int ad4630_buffer_preenable(struct iio_dev *indio_dev)
 	spi_message_add_tail(&xfer, &msg);
 	spi_engine_offload_load_msg(st->spi, &msg);
 	spi_engine_offload_enable(st->spi, true);
-	mutex_lock(&st->lock);
 
 	return ret;
 }
@@ -725,7 +793,6 @@ static int ad4630_buffer_postdisable(struct iio_dev *indio_dev)
 	spi_engine_offload_enable(st->spi, false);
 	spi_bus_unlock(st->spi->master);
 
-	mutex_unlock(&st->lock);
 	ret = ad4630_set_reg_access(st, true);
 	if (ret < 0)
 		return ret;
@@ -908,10 +975,12 @@ static int ad4630_probe(struct spi_device *spi)
 	ret = clk_prepare_enable(st->trigger_clock);
 	if (ret)
 		return ret;
+
 	ret = devm_add_action_or_reset(&spi->dev, ad4630_clk_disable,
 				       st->trigger_clock);
 	if (ret)
 		return ret;
+
 	st->conversion_trigger = devm_pwm_get(&spi->dev, "cnv");
 	if (IS_ERR(st->conversion_trigger))
 		return PTR_ERR(st->conversion_trigger);
@@ -930,7 +999,7 @@ static int ad4630_probe(struct spi_device *spi)
 	if (ret < 0)
 		return ret;
 
-	st->gpio_reset = devm_gpiod_get(&st->spi->dev, "reset", GPIOD_OUT_LOW);
+	st->gpio_reset = devm_gpiod_get(&st->spi->dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(st->gpio_reset))
 		return PTR_ERR(st->gpio_reset);
 
@@ -956,7 +1025,6 @@ static int ad4630_probe(struct spi_device *spi)
 	if (device_id == ID_AD463X) {
 		ret = ad4630_spi_read_reg(st, AD4630_REG_CHIP_GRADE,
 					  &device_id);
-		pr_err("\n[adc]devid = %d",device_id);
 		if (ret < 0)
 			return ret;
 
