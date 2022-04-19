@@ -106,5 +106,7 @@ jobs:
   - checkout: self
     fetchDepth: 1
     clean: true
-  - script: ./ci/travis/run-build-docker.sh
+  - script: |
+      echo "UID=$UID, GID=$GID"
+      ./ci/travis/run-build-docker.sh
     displayName: "Build test for '$(DEFCONFIG)'"

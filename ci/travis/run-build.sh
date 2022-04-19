@@ -4,6 +4,10 @@ set -e
 # cd to docker build dir if it exists
 if [ -d /docker_build_dir ] ; then
 	cd /docker_build_dir
+	# make sure git does not complain about unsafe repositories when
+	# building inside docker.
+	git config  --global --add safe.directory /docker_build_dir
+	echo "UID=$UID, GID=$GID"
 fi
 
 . ./ci/travis/lib.sh
